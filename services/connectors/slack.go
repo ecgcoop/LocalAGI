@@ -208,9 +208,15 @@ func generateAttachmentsFromJobResponse(j *types.JobResult, api *slack.Client, c
 	return
 }
 
-func scanImagesInMessages(api *slack.Client, ev *slackevents.MessageEvent) (*bytes.Buffer, string) {
-	imageBytes := new(bytes.Buffer)
-	mimeType := "image/jpeg"
+// ImageData represents a single image with its metadata
+type ImageData struct {
+	Data     []byte
+	MimeType string
+}
+
+// scanImagesInMessages scans for all images in a message and returns them as a slice
+func scanImagesInMessages(api *slack.Client, ev *slackevents.MessageEvent) []ImageData {
+	var images []ImageData
 
 	// Fetch the message using the API
 	messages, _, _, err := api.GetConversationReplies(&slack.GetConversationRepliesParameters{
@@ -220,25 +226,142 @@ func scanImagesInMessages(api *slack.Client, ev *slackevents.MessageEvent) (*byt
 
 	if err != nil {
 		xlog.Error(fmt.Sprintf("Error fetching messages: %v", err))
-	} else {
-		for _, msg := range messages {
-			if len(msg.Files) == 0 {
-				continue
-			}
-			for _, attachment := range msg.Files {
-				if attachment.URLPrivate != "" {
-					xlog.Debug(fmt.Sprintf("Getting Attachment: %+v", attachment))
-					// download image with slack api
-					mimeType = attachment.Mimetype
-					if err := api.GetFile(attachment.URLPrivate, imageBytes); err != nil {
-						xlog.Error(fmt.Sprintf("Error downloading image: %v", err))
-					}
+		return images
+	}
+
+	xlog.Debug("Scanning images in messages", "messages", messages)
+	for _, msg := range messages {
+		if len(msg.Files) == 0 {
+			xlog.Debug("No files in message", "message", msg.Text)
+			continue
+		}
+		xlog.Debug("Files in message", "files", msg.Files)
+		for _, attachment := range msg.Files {
+			if attachment.URLPrivate != "" {
+				xlog.Debug(fmt.Sprintf("Getting Attachment: %+v", attachment))
+				// download image with slack api
+				imageBytes := new(bytes.Buffer)
+				if err := api.GetFile(attachment.URLPrivate, imageBytes); err != nil {
+					xlog.Error(fmt.Sprintf("Error downloading image: %v", err))
+					continue
 				}
+
+				images = append(images, ImageData{
+					Data:     imageBytes.Bytes(),
+					MimeType: attachment.Mimetype,
+				})
 			}
 		}
 	}
 
-	return imageBytes, mimeType
+	return images
+}
+
+// scanImagesInAppMentionEvent scans for all images in an app mention event
+func scanImagesInAppMentionEvent(api *slack.Client, ev *slackevents.AppMentionEvent) []ImageData {
+	var images []ImageData
+
+	// Fetch the message using the API
+	messages, _, _, err := api.GetConversationReplies(&slack.GetConversationRepliesParameters{
+		ChannelID: ev.Channel,
+		Timestamp: ev.TimeStamp,
+	})
+
+	if err != nil {
+		xlog.Error(fmt.Sprintf("Error fetching messages: %v", err))
+		return images
+	}
+
+	xlog.Debug("Scanning images in app mention event", "messages", messages)
+	for _, msg := range messages {
+		if len(msg.Files) == 0 {
+			xlog.Debug("No files in message", "message", msg.Text)
+			continue
+		}
+		xlog.Debug("Files in message", "files", msg.Files)
+		for _, attachment := range msg.Files {
+			if attachment.URLPrivate != "" {
+				xlog.Debug(fmt.Sprintf("Getting Attachment: %+v", attachment))
+				// download image with slack api
+				imageBytes := new(bytes.Buffer)
+				if err := api.GetFile(attachment.URLPrivate, imageBytes); err != nil {
+					xlog.Error(fmt.Sprintf("Error downloading image: %v", err))
+					continue
+				}
+
+				images = append(images, ImageData{
+					Data:     imageBytes.Bytes(),
+					MimeType: attachment.Mimetype,
+				})
+			}
+		}
+	}
+
+	return images
+}
+
+// scanImagesInThreadMessage scans for all images in a single thread message
+func scanImagesInThreadMessage(api *slack.Client, msg slack.Message) []ImageData {
+	var images []ImageData
+
+	if len(msg.Files) == 0 {
+		return images
+	}
+
+	xlog.Debug("found files in the message", "files", len(msg.Files))
+	for _, attachment := range msg.Files {
+		if attachment.URLPrivate != "" {
+			xlog.Debug(fmt.Sprintf("Getting Attachment: %+v", attachment))
+			// download image with slack api
+			imageBytes := new(bytes.Buffer)
+			if err := api.GetFile(attachment.URLPrivate, imageBytes); err != nil {
+				xlog.Error(fmt.Sprintf("Error downloading image: %v", err))
+				continue
+			}
+
+			images = append(images, ImageData{
+				Data:     imageBytes.Bytes(),
+				MimeType: attachment.Mimetype,
+			})
+		}
+	}
+
+	return images
+}
+
+// createMultiContentMessage creates a ChatCompletionMessage with text and multiple images
+func createMultiContentMessage(role, text string, images []ImageData) openai.ChatCompletionMessage {
+	multiContent := []openai.ChatMessagePart{
+		{
+			Text: text,
+			Type: openai.ChatMessagePartTypeText,
+		},
+	}
+
+	for _, img := range images {
+		imgBase64, err := encodeImageFromBytes(img.Data)
+		if err != nil {
+			xlog.Error(fmt.Sprintf("Error encoding image to base64: %v", err))
+			continue
+		}
+
+		multiContent = append(multiContent, openai.ChatMessagePart{
+			Type: openai.ChatMessagePartTypeImageURL,
+			ImageURL: &openai.ChatMessageImageURL{
+				URL: fmt.Sprintf("data:%s;base64,%s", img.MimeType, imgBase64),
+			},
+		})
+	}
+
+	return openai.ChatCompletionMessage{
+		Role:         role,
+		MultiContent: multiContent,
+	}
+}
+
+// encodeImageFromBytes encodes image bytes to base64
+func encodeImageFromBytes(imageData []byte) (string, error) {
+	return base64.StdEncoding.EncodeToString(imageData), nil
 }
 
 func (t *Slack) handleChannelMessage(
@@ -266,37 +389,15 @@ func (t *Slack) handleChannelMessage(
 
 	go func() {
 
-		imageBytes, mimeType := scanImagesInMessages(api, ev)
+		images := scanImagesInMessages(api, ev)
 
 		agentOptions := []types.JobOption{
 			types.WithUUID(ev.ThreadTimeStamp),
 		}
 
 		// If the last message has an image, we send it as a multi content message
-		if len(imageBytes.Bytes()) > 0 {
-			// // Encode the image to base64
-			imgBase64, err := encodeImageFromURL(*imageBytes)
-			if err != nil {
-				xlog.Error(fmt.Sprintf("Error encoding image to base64: %v", err))
-			} else {
-				currentConv = append(currentConv,
-					openai.ChatCompletionMessage{
-						Role: "user",
-						MultiContent: []openai.ChatMessagePart{
-							{
-								Text: message,
-								Type: openai.ChatMessagePartTypeText,
-							},
-							{
-								Type: openai.ChatMessagePartTypeImageURL,
-								ImageURL: &openai.ChatMessageImageURL{
-									URL: fmt.Sprintf("data:%s;base64,%s", mimeType, imgBase64),
-								},
-							},
-						},
-					},
-				)
-			}
+		if len(images) > 0 {
+			currentConv = append(currentConv, createMultiContentMessage("user", message, images))
 		} else {
 			currentConv = append(currentConv, openai.ChatCompletionMessage{
 				Role:    "user",
@@ -365,14 +466,6 @@ func (t *Slack) handleChannelMessage(
 		replyWithPostMessage(res.Response, api, ev, postMessageParams, res)
 
 	}()
-}
-
-// Function to download the image from a URL and encode it to base64
-func encodeImageFromURL(imageBytes bytes.Buffer) (string, error) {
-
-	// Encode the image data to base64
-	base64Image := base64.StdEncoding.EncodeToString(imageBytes.Bytes())
-	return base64Image, nil
 }
 
 func replyWithPostMessage(finalResponse string, api *slack.Client, ev *slackevents.MessageEvent, postMessageParams slack.PostMessageParameters, res *types.JobResult) {
@@ -528,7 +621,7 @@ func (t *Slack) handleMention(
 			if err != nil {
 				xlog.Error(fmt.Sprintf("Error fetching thread messages: %v", err))
 			} else {
-				for i, msg := range messages {
+				for _, msg := range messages {
 					// Skip our placeholder message
 					if msg.Timestamp == msgTs {
 						continue
@@ -539,52 +632,19 @@ func (t *Slack) handleMention(
 						role = "user"
 					}
 
-					imageBytes := new(bytes.Buffer)
-					mimeType := "image/jpeg"
+					images := scanImagesInThreadMessage(api, msg)
 
-					xlog.Debug(fmt.Sprintf("Message: %+v", msg))
-					if len(msg.Files) > 0 {
-						for _, attachment := range msg.Files {
-
-							if attachment.URLPrivate != "" {
-								xlog.Debug(fmt.Sprintf("Getting Attachment: %+v", attachment))
-								mimeType = attachment.Mimetype
-								// download image with slack api
-								if err := api.GetFile(attachment.URLPrivate, imageBytes); err != nil {
-									xlog.Error(fmt.Sprintf("Error downloading image: %v", err))
-								}
-							}
-						}
-					}
 					// If the last message has an image, we send it as a multi content message
-					if len(imageBytes.Bytes()) > 0 && i == len(messages)-1 {
+					if len(images) > 0 {
 
-						// // Encode the image to base64
-						imgBase64, err := encodeImageFromURL(*imageBytes)
-						if err != nil {
-							xlog.Error(fmt.Sprintf("Error encoding image to base64: %v", err))
-						}
+						xlog.Debug("found image in an existing thread", "image", len(images))
 
 						threadMessages = append(
 							threadMessages,
-							openai.ChatCompletionMessage{
-								Role: role,
-								MultiContent: []openai.ChatMessagePart{
-									{
-										Text: replaceUserIDsWithNamesInMessage(api, cleanUpUsernameFromMessage(msg.Text, b)),
-										Type: openai.ChatMessagePartTypeText,
-									},
-									{
-										Type: openai.ChatMessagePartTypeImageURL,
-										ImageURL: &openai.ChatMessageImageURL{
-											URL: fmt.Sprintf("data:%s;base64,%s", mimeType, imgBase64),
-											//	URL: imgUrl,
-										},
-									},
-								},
-							},
+							createMultiContentMessage(role, replaceUserIDsWithNamesInMessage(api, cleanUpUsernameFromMessage(msg.Text, b)), images),
 						)
 					} else {
+						xlog.Debug("no image in the last message of the thread", "message", msg.Text)
 						threadMessages = append(
 							threadMessages,
 							openai.ChatCompletionMessage{
@@ -597,62 +657,15 @@ func (t *Slack) handleMention(
 			}
 		} else {
 
-			imageBytes := new(bytes.Buffer)
-			mimeType := "image/jpeg"
-
-			// Fetch the message using the API
-			messages, _, _, err := api.GetConversationReplies(&slack.GetConversationRepliesParameters{
-				ChannelID: ev.Channel,
-				Timestamp: ev.TimeStamp,
-			})
-
-			if err != nil {
-				xlog.Error(fmt.Sprintf("Error fetching messages: %v", err))
-			} else {
-				for _, msg := range messages {
-					if len(msg.Files) == 0 {
-						continue
-					}
-					for _, attachment := range msg.Files {
-						if attachment.URLPrivate != "" {
-							xlog.Debug(fmt.Sprintf("Getting Attachment: %+v", attachment))
-							// download image with slack api
-							mimeType = attachment.Mimetype
-							if err := api.GetFile(attachment.URLPrivate, imageBytes); err != nil {
-								xlog.Error(fmt.Sprintf("Error downloading image: %v", err))
-							}
-						}
-					}
-				}
-			}
+			images := scanImagesInAppMentionEvent(api, ev)
 
 			// If the last message has an image, we send it as a multi content message
-			if len(imageBytes.Bytes()) > 0 {
+			if len(images) > 0 {
 
-				// // Encode the image to base64
-				imgBase64, err := encodeImageFromURL(*imageBytes)
-				if err != nil {
-					xlog.Error(fmt.Sprintf("Error encoding image to base64: %v", err))
-				}
-
+				xlog.Debug("found image in the last message of the thread", "image", len(images))
 				threadMessages = append(
 					threadMessages,
-					openai.ChatCompletionMessage{
-						Role: "user",
-						MultiContent: []openai.ChatMessagePart{
-							{
-								Text: replaceUserIDsWithNamesInMessage(api, cleanUpUsernameFromMessage(message, b)),
-								Type: openai.ChatMessagePartTypeText,
-							},
-							{
-								Type: openai.ChatMessagePartTypeImageURL,
-								ImageURL: &openai.ChatMessageImageURL{
-									//	URL: imgURL,
-									URL: fmt.Sprintf("data:%s;base64,%s", mimeType, imgBase64),
-								},
-							},
-						},
-					},
+					createMultiContentMessage("user", replaceUserIDsWithNamesInMessage(api, cleanUpUsernameFromMessage(message, b)), images),
 				)
 			} else {
 				threadMessages = append(threadMessages, openai.ChatCompletionMessage{
